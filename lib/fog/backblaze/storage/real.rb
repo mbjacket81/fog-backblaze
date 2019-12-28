@@ -183,7 +183,7 @@ class Fog::Backblaze::Storage::Real
     if local_file_path.size / 1024 / 1024 > 50
       handle_large_object_upload(bucket_name, file_path, local_file_path, options)
     else
-      handle_small_object_upload(bucket_name, file_path, local_file_path, options)
+      handle_small_object_upload(bucket_name, file_path, local_file_path, options, upload_url)
     end
   end
 
@@ -473,7 +473,7 @@ class Fog::Backblaze::Storage::Real
     )
   end
 
-  def handle_small_object_upload(bucket_name, file_path, local_file_path, options = {})
+  def handle_small_object_upload(bucket_name, file_path, local_file_path, options = {}, upload_url)
     if local_file_path.is_a?(IO)
       local_file_path = local_file_path.read
     end
