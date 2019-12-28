@@ -173,57 +173,18 @@ class Fog::Backblaze::Storage::Real
   # * last_modified - time object or number of miliseconds
   # * content_disposition
   # * extra_headers - hash, list of custom headers
-  def put_object(bucket_name, file_path, content, options = {})
+  def put_object(bucket_name, file_path, local_file_path, options = {})
+    bucket_id = _get_bucket_id!(bucket_name)
     upload_url = @token_cache.fetch("upload_url/#{bucket_name}") do
-      bucket_id = _get_bucket_id!(bucket_name)
       result = b2_command(:b2_get_upload_url, body: {bucketId: bucket_id})
       result.json
     end
-
-    if content.is_a?(IO)
-      content = content.read
+    
+    if local_file_path.size / 1024 / 1024 > 50
+      handle_large_object_upload(bucket_name, file_path, local_file_path, options)
+    else
+      handle_small_object_upload(bucket_name, file_path, local_file_path, options)
     end
-
-    extra_headers = {}
-    if options[:content_type]
-      extra_headers['Content-Type'] = options[:content_type]
-    end
-
-    if options[:last_modified]
-      value = if options[:last_modified].is_a?(::Time)
-        (options[:last_modified].to_f * 1000).round
-      else
-        value
-      end
-      extra_headers['X-Bz-Info-src_last_modified_millis'] = value
-    end
-
-    if options[:content_disposition]
-      extra_headers['X-Bz-Info-b2-content-disposition'] = options[:content_disposition]
-    end
-
-    if options[:extra_headers]
-      options[:extra_headers].each do |key, value|
-        extra_headers["X-Bz-Info-#{key}"] = value
-      end
-    end
-
-    response = b2_command(nil,
-      url: upload_url['uploadUrl'],
-      body: content,
-      headers: {
-        'Authorization': upload_url['authorizationToken'],
-        'Content-Type': 'b2/x-auto',
-        'X-Bz-File-Name': "#{_esc_file(file_path)}",
-        'X-Bz-Content-Sha1': Digest::SHA1.hexdigest(content)
-      }.merge(extra_headers)
-    )
-
-    if response.json['fileId'] == nil
-      raise Fog::Errors::Error, "Failed put_object, status = #{response.status} #{response.body}"
-    end
-
-    response
   end
 
   # generates url regardless if bucket is private or not
@@ -277,18 +238,17 @@ class Fog::Backblaze::Storage::Real
   def delete_object(bucket_name, file_name)
     version_ids = _get_object_version_ids(bucket_name, file_name)
 
-    if version_ids.size == 0
-      raise Fog::Errors::NotFound, "Can not find #{file_name} in in bucket #{bucket_name}"
-    end
-
-    logger.info("Deleting #{version_ids.size} versions of #{file_name}")
-
     last_response = nil
-    version_ids.each do |version_id|
-      last_response = b2_command(:b2_delete_file_version, body: {
-        fileName: file_name,
-        fileId: version_id
-      })
+    # raise Fog::Errors::NotFound, "Can not find #{file_name} in in bucket #{bucket_name}"
+    if version_ids.size != 0
+      logger.info("Deleting #{version_ids.size} versions of #{file_name}")
+
+      version_ids.each do |version_id|
+        last_response = b2_command(:b2_delete_file_version, body: {
+          fileName: file_name,
+          fileId: version_id
+        })
+      end
     end
 
     last_response
@@ -341,8 +301,8 @@ class Fog::Backblaze::Storage::Real
   def _get_object_version_ids(bucket_name, file_name)
     response = b2_command(:b2_list_file_versions,
       body: {
-        startFileName: file_name,
-        prefix: file_name,
+        startFileName: File.basename(file_name),
+        prefix: File.dirname(file_name),
         bucketId: _get_bucket_id!(bucket_name),
         maxFileCount: 1000
       }
@@ -435,6 +395,129 @@ class Fog::Backblaze::Storage::Real
     @token_cache.auth_response = @auth_response.json
 
     @auth_response.json
+  end
+
+  def handle_large_object_upload(bucket_name, file_path, local_file_path, options = {})
+    # Start large file upload
+    start_large_file_response = b2_command(
+      :b2_start_large_file, 
+      body: {
+        bucketId: bucket_id, 
+        fileName: file_path, 
+        contentType: options[:content_type] 
+      }
+    )
+
+    # Get upload part url
+    file_id = start_large_file_response.json["fileId"]
+    get_upload_part_url_response = b2_command(
+      :b2_get_upload_part_url,
+      body: {
+        fileId: file_id
+      }
+    )
+
+    upload_url = get_upload_part_url_response.json["uploadUrl"]
+    minimum_part_size_bytes = @token_cache.auth_response["recommendedPartSize"]
+    upload_authorization_token = get_upload_part_url_response.json["authorizationToken"]
+    content_type = options[:content_type]
+    local_file_size = File.stat(local_file_path).size 
+    total_bytes_sent = 0
+    bytes_sent_for_part = minimum_part_size_bytes
+    # SHA1 of each uploaded part. 
+    # You will need to save these because you will need them in b2_finish_large_file
+    sha1_of_parts = Array.new
+    sha1_part_index = 1
+    while total_bytes_sent < local_file_size do
+      # Determine num bytes to send 
+      if ((local_file_size - total_bytes_sent) < minimum_part_size_bytes) 
+        bytes_sent_for_part = (local_file_size - total_bytes_sent)
+      end
+
+      # Read file into memory and calculate a SHA1
+      file_part_data = File.read(local_file_path, bytes_sent_for_part, total_bytes_sent, mode: "rb")
+      sha1_of_parts.push(Digest::SHA1.hexdigest(file_part_data))
+      hex_digest_of_part = sha1_of_parts[sha1_part_index - 1]
+
+      # Send it over the wire
+      uri = URI(upload_url)
+      req = Net::HTTP::Post.new(uri)
+      req.add_field("Authorization", upload_authorization_token)
+      req.add_field("X-Bz-Part-Number", sha1_part_index)
+      req.add_field("X-Bz-Content-Sha1", hex_digest_of_part)
+      req.add_field("Content-Length", bytes_sent_for_part)
+      req.body = file_part_data
+      http = Net::HTTP.new(req.uri.host, req.uri.port)
+      http.use_ssl = (req.uri.scheme == 'https')
+      res = http.start {|http| http.request(req)}
+      case res
+      when Net::HTTPSuccess then
+        JSON.parse(res.body)
+      when Net::HTTPRedirection then
+        fetch(res['location'], limit - 1)
+      else
+        JSON.parse(res.body)
+      end
+      # Prepare for the next iteration of the loop
+      total_bytes_sent += bytes_sent_for_part 
+      #offset = total_bytes_sent
+      sha1_part_index += 1
+    end
+
+    b2_command(
+      :b2_finish_large_file,
+      body: {
+        fileId: file_id,
+        partSha1Array: sha1_of_parts
+      }
+    )
+  end
+
+  def handle_small_object_upload(bucket_name, file_path, local_file_path, options = {})
+    if local_file_path.is_a?(IO)
+      local_file_path = local_file_path.read
+    end
+
+    extra_headers = {}
+    if options[:content_type]
+      extra_headers['Content-Type'] = options[:content_type]
+    end
+
+    if options[:last_modified]
+      value = if options[:last_modified].is_a?(::Time)
+        (options[:last_modified].to_f * 1000).round
+      else
+        value
+      end
+      extra_headers['X-Bz-Info-src_last_modified_millis'] = value
+    end
+
+    if options[:content_disposition]
+      extra_headers['X-Bz-Info-b2-content-disposition'] = options[:content_disposition]
+    end
+
+    if options[:extra_headers]
+      options[:extra_headers].each do |key, value|
+        extra_headers["X-Bz-Info-#{key}"] = value
+      end
+    end
+
+    response = b2_command(nil,
+      url: upload_url['uploadUrl'],
+      body: local_file_path,
+      headers: {
+        'Authorization': upload_url['authorizationToken'],
+        'Content-Type': 'b2/x-auto',
+        'X-Bz-File-Name': "#{_esc_file(file_path)}",
+        'X-Bz-Content-Sha1': Digest::SHA1.hexdigest(local_file_path)
+      }.merge(extra_headers)
+    )
+
+    if response.json['fileId'] == nil
+      raise Fog::Errors::Error, "Failed put_object, status = #{response.status} #{response.body}"
+    end
+
+    response
   end
 
   def b2_command(command, options = {})
